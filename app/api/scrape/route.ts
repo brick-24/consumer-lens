@@ -16,7 +16,120 @@ const SUPPORTED_DOMAINS = [
 ]
 
 const USER_AGENT =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+
+const BROWSER_HEADERS = {
+  'User-Agent': USER_AGENT,
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+  'Accept-Language': 'en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7',
+  'Accept-Encoding': 'identity',
+  'Cache-Control': 'no-cache',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  'Upgrade-Insecure-Requests': '1',
+  'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"',
+}
+
+interface BotChallengeResult {
+  isChallenge: boolean
+  platform: string
+  reason?: string
+}
+
+/** Detect if an e-commerce platform returned a CAPTCHA, bot challenge, or WAF block */
+function detectBotChallenge(
+  html: string,
+  statusCode: number,
+  domain: string
+): BotChallengeResult {
+  const lowerHtml = html.toLowerCase()
+  const isAmazon = domain.includes('amazon') || domain.includes('amzn')
+  const platform = isAmazon ? 'Amazon' : domain.includes('flipkart') ? 'Flipkart' : 'E-commerce'
+
+  // 1. HTTP 503 from Amazon is virtually always bot throttling / CAPTCHA
+  if (statusCode === 503 && isAmazon) {
+    return {
+      isChallenge: true,
+      platform,
+      reason: 'Amazon anti-bot rate-limiting / CAPTCHA challenge (HTTP 503)',
+    }
+  }
+
+  // 2. HTTP 429 Too Many Requests
+  if (statusCode === 429) {
+    return {
+      isChallenge: true,
+      platform,
+      reason: 'Too Many Requests / automated access rate-limited (HTTP 429)',
+    }
+  }
+
+  // 3. Amazon CAPTCHA and Robot Check indicators in HTML
+  const amazonCaptchaPatterns = [
+    /validatecaptcha/i,
+    /api-services-support@amazon\.com/i,
+    /enter the characters you see below/i,
+    /type the characters you see in this image/i,
+    /sorry,?\s*we just need to make sure you'?re not a robot/i,
+    /to discuss automated access to amazon data/i,
+    /images\/g\/01\/appcore\/load/i,
+    /<title[^>]*>\s*(?:Robot Check|Amazon CAPTCHA|Bot Detection)\s*<\/title>/i,
+    /id="captchacharacters"/i,
+  ]
+
+  for (const pattern of amazonCaptchaPatterns) {
+    if (pattern.test(html)) {
+      return {
+        isChallenge: true,
+        platform: 'Amazon',
+        reason: 'Amazon CAPTCHA challenge page detected',
+      }
+    }
+  }
+
+  // 4. Generic WAF / Cloudflare / ShieldSquare anti-bot pages
+  const genericChallengePatterns = [
+    /attention required!\s*\|\s*cloudflare/i,
+    /cf-turnstile/i,
+    /cf-chl-bypass/i,
+    /challenge-platform/i,
+    /shieldsquare/i,
+    /perimeterx/i,
+    /_pxhd/i,
+    /<title[^>]*>\s*(?:Access Denied|Security Check|Just a moment\.\.\.)\s*<\/title>/i,
+  ]
+
+  for (const pattern of genericChallengePatterns) {
+    if (pattern.test(html)) {
+      return {
+        isChallenge: true,
+        platform,
+        reason: 'Anti-bot / WAF security challenge detected',
+      }
+    }
+  }
+
+  // 5. HTTP 403 Forbidden with security block text
+  if (
+    statusCode === 403 &&
+    (lowerHtml.includes('forbidden') ||
+      lowerHtml.includes('access denied') ||
+      lowerHtml.includes('captcha') ||
+      lowerHtml.includes('challenge'))
+  ) {
+    return {
+      isChallenge: true,
+      platform,
+      reason: 'Access blocked by automated security firewall (HTTP 403)',
+    }
+  }
+
+  return { isChallenge: false, platform }
+}
 
 function normalizeUrl(inputUrl: string): string {
   let trimmed = inputUrl.trim()
@@ -243,6 +356,7 @@ export async function POST(req: NextRequest) {
     let html = ''
     let lastError: Error | null = null
     let resolvedUrl = targetUrl
+    let detectedChallenge: BotChallengeResult | null = null
 
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
@@ -250,25 +364,34 @@ export async function POST(req: NextRequest) {
         const timeout = setTimeout(() => controller.abort(), 15000)
 
         const response = await fetch(targetUrl, {
-          headers: {
-            'User-Agent': USER_AGENT,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-IN,en;q=0.9,hi;q=0.8',
-            'Accept-Encoding': 'identity',
-            'Cache-Control': 'no-cache',
-          },
+          headers: BROWSER_HEADERS,
           signal: controller.signal,
           redirect: 'follow',
         })
 
         clearTimeout(timeout)
+        resolvedUrl = response.url || targetUrl
 
+        // If not ok (e.g. 503, 429, 403), check if it's an anti-bot challenge
         if (!response.ok) {
+          const errBody = await response.text().catch(() => '')
+          const challenge = detectBotChallenge(errBody, response.status, domain)
+          if (challenge.isChallenge) {
+            detectedChallenge = challenge
+            break
+          }
           throw new Error(`HTTP ${response.status}: ${response.statusText}`)
         }
 
-        resolvedUrl = response.url || targetUrl
         html = await response.text()
+
+        // Check if 200 response contains a CAPTCHA or robot challenge
+        const challenge = detectBotChallenge(html, response.status, domain)
+        if (challenge.isChallenge) {
+          detectedChallenge = challenge
+          break
+        }
+
         lastError = null
         break
       } catch (err) {
@@ -277,6 +400,19 @@ export async function POST(req: NextRequest) {
           await new Promise((r) => setTimeout(r, 1000))
         }
       }
+    }
+
+    // If a bot challenge was detected at any point, return explicit 422
+    if (detectedChallenge) {
+      return NextResponse.json(
+        {
+          error: `${detectedChallenge.platform} anti-bot verification (CAPTCHA/503) detected.`,
+          isBotChallenge: true,
+          platform: detectedChallenge.platform,
+          message: `${detectedChallenge.platform}'s anti-bot system is serving a security challenge (${detectedChallenge.reason || 'CAPTCHA'}). Automated scraping cannot extract packaging images. Please upload product packaging photos manually.`,
+        },
+        { status: 422 }
+      )
     }
 
     if (lastError || !html) {
@@ -290,6 +426,20 @@ export async function POST(req: NextRequest) {
 
     // Determine domain from resolved URL (e.g. amzn.in redirects to amazon.in)
     const finalDomain = extractDomain(resolvedUrl) || domain
+
+    // Re-check challenge with final domain context
+    const finalChallenge = detectBotChallenge(html, 200, finalDomain)
+    if (finalChallenge.isChallenge) {
+      return NextResponse.json(
+        {
+          error: `${finalChallenge.platform} anti-bot verification (CAPTCHA) detected.`,
+          isBotChallenge: true,
+          platform: finalChallenge.platform,
+          message: `${finalChallenge.platform}'s anti-bot system is serving a security challenge (${finalChallenge.reason || 'CAPTCHA'}). Automated scraping cannot extract packaging images. Please upload product packaging photos manually.`,
+        },
+        { status: 422 }
+      )
+    }
 
     // Extract structured data based on domain
     let extractedText = ''
@@ -308,6 +458,25 @@ export async function POST(req: NextRequest) {
     const images = extractProductImages(html)
     const image = images.length > 0 ? images[0] : null
 
+    // Post-extraction challenge check: If 0 images AND title or text indicates a bot/landing challenge
+    const isSuspectTitle =
+      /^(?:Robot Check|Amazon(?:\.in|\.com)?|Access Denied|Sorry! Something went wrong)$/i.test(title.trim()) ||
+      title.toLowerCase().includes('robot check') ||
+      title.toLowerCase().includes('captcha')
+
+    if (images.length === 0 && (isSuspectTitle || extractedText.toLowerCase().includes('validatecaptcha') || extractedText.toLowerCase().includes('automated access to amazon'))) {
+      const platformName = finalDomain.includes('amazon') ? 'Amazon' : 'E-commerce'
+      return NextResponse.json(
+        {
+          error: `${platformName} anti-bot challenge detected.`,
+          isBotChallenge: true,
+          platform: platformName,
+          message: `${platformName}'s security system blocked product image extraction with a verification challenge. Please upload packaging photos manually below.`,
+        },
+        { status: 422 }
+      )
+    }
+
     // Truncate to a reasonable size for the AI model
     const maxLength = 14000
     if (extractedText.length > maxLength) {
@@ -319,6 +488,7 @@ export async function POST(req: NextRequest) {
       title,
       image,
       images,
+      hasNoImages: images.length === 0,
       domain: finalDomain,
       resolvedUrl,
     })

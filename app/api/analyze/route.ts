@@ -250,6 +250,22 @@ export async function POST(req: NextRequest) {
       const totalPhotos = allImages.length
       console.log(`[Analyze] Initiating analysis with ${totalPhotos} packaging image(s)...`)
 
+      // Guard: If URL scrape returned no images and the listing text is bot challenge / empty, fail gracefully
+      if (sourceType === 'url' && allImages.length === 0) {
+        const isBotBlocked =
+          /validatecaptcha|api-services-support@amazon\.com|enter the characters you see below|robot check|make sure you'?re not a robot/i.test(
+            listingText || ''
+          )
+        if (isBotBlocked || !listingText || listingText.trim().length < 50) {
+          send('error', {
+            error:
+              'Anti-bot challenge or empty product listing detected without packaging images. Please upload packaging photos manually to perform LMPC compliance verification.',
+          })
+          close()
+          return
+        }
+      }
+
       // Send progress updates with clear photo count
       const photoText = totalPhotos > 1 ? `${totalPhotos} packaging photos` : 'label'
       send('progress', { step: 1, message: `Extracting text & declarations from ${photoText}` })

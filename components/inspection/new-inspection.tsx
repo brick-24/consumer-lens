@@ -142,6 +142,10 @@ export function NewInspection() {
   const [isCameraOpen, setIsCameraOpen] = useState(false)
   const [isScraping, setIsScraping] = useState(false)
   const [scrapeError, setScrapeError] = useState<string | null>(null)
+  const [botChallengeInfo, setBotChallengeInfo] = useState<{
+    platform: string
+    message: string
+  } | null>(null)
   const [savedInspection, setSavedInspection] = useState<Inspection | null>(null)
   const [isSaved, setIsSaved] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
@@ -301,6 +305,8 @@ export function NewInspection() {
 
   const handleIncomingFile = async (file: File, nameFallback?: string) => {
     setFileName(file.name || nameFallback || 'Product Label.jpg')
+    setBotChallengeInfo(null)
+    setScrapeError(null)
     const { dataUrl, file: compressed } = await compressImageFile(file)
     if (dataUrl) {
       if (!image) {
@@ -449,6 +455,7 @@ export function NewInspection() {
 
     setIsScraping(true)
     setScrapeError(null)
+    setBotChallengeInfo(null)
 
     try {
       const res = await fetch('/api/scrape', {
@@ -459,9 +466,18 @@ export function NewInspection() {
 
       const data = await res.json()
 
-      if (!res.ok) {
-        setScrapeError(data.error || 'Failed to fetch product page')
+      if (!res.ok || data.isBotChallenge) {
         setIsScraping(false)
+        if (data.isBotChallenge) {
+          setBotChallengeInfo({
+            platform: data.platform || 'Amazon',
+            message:
+              data.message ||
+              `${data.platform || 'Amazon'} anti-bot verification (CAPTCHA/503) challenge blocked automated listing retrieval.`,
+          })
+        } else {
+          setScrapeError(data.error || 'Failed to fetch product page')
+        }
         return
       }
 
@@ -470,15 +486,26 @@ export function NewInspection() {
         ? data.images
         : (data.image ? [data.image] : [])
 
+      if (data.title) {
+        setFileName(data.title)
+      }
+
+      // Guard: If 0 images were extracted and user hasn't uploaded any local photo
+      if (allImgs.length === 0 && !image) {
+        setIsScraping(false)
+        setBotChallengeInfo({
+          platform: data.domain?.includes('amazon') ? 'Amazon' : 'E-commerce',
+          message:
+            'No packaging images could be extracted from this product link. Legal Metrology (LMPC) compliance requires packaging photos to inspect mandatory declarations (MRP, batch number, customer care, manufacturer details). Please manually upload packaging images below.',
+        })
+        return
+      }
+
       if (allImgs.length > 0 && !image) {
         setImage(allImgs[0])
         if (allImgs.length > 1) {
           setExtraImages(allImgs.slice(1))
         }
-      }
-
-      if (data.title) {
-        setFileName(data.title)
       }
 
       // Run analysis with scraped text and ALL extracted packaging images
@@ -699,6 +726,7 @@ export function NewInspection() {
     setError(null)
     setActiveKey(null)
     setScrapeError(null)
+    setBotChallengeInfo(null)
     setSavedInspection(null)
     setIsSaved(false)
     setStep('capture')
@@ -886,6 +914,8 @@ export function NewInspection() {
                     'group/dropbox relative flex flex-1 flex-col items-center justify-center gap-3 rounded-lg border-2 border-dashed p-4 md:p-6 text-center transition-all duration-200 cursor-pointer min-h-[180px] md:min-h-[340px] select-none bg-[#FAF8F5]',
                     image
                       ? 'border-border bg-white'
+                      : botChallengeInfo
+                      ? 'border-amber-500 bg-amber-50/40 ring-2 ring-amber-400/40'
                       : dragActive
                       ? 'border-primary bg-primary/[0.04]'
                       : 'border-muted-foreground/30 hover:border-primary'
@@ -1006,6 +1036,7 @@ export function NewInspection() {
                       onChange={(e) => {
                         setProductLink(e.target.value)
                         setScrapeError(null)
+                        setBotChallengeInfo(null)
                       }}
                       onKeyDown={(e) => {
                         if (e.key === 'Enter') {
@@ -1038,6 +1069,50 @@ export function NewInspection() {
                   </div>
                   {scrapeError && (
                     <p className="mt-1.5 text-xs text-danger">{scrapeError}</p>
+                  )}
+                  {botChallengeInfo && (
+                    <div className="mt-3 rounded-lg border border-amber-300/80 bg-amber-50/90 dark:bg-amber-950/30 p-3.5 shadow-xs animate-[fadeIn_0.25s_ease-out]">
+                      <div className="flex items-start gap-2.5">
+                        <ShieldAlert className="size-4.5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-xs font-semibold text-amber-900 dark:text-amber-200">
+                              {botChallengeInfo.platform} Anti-Bot / CAPTCHA Challenge Detected
+                            </p>
+                            <button
+                              type="button"
+                              onClick={() => setBotChallengeInfo(null)}
+                              className="text-amber-700/60 hover:text-amber-900 dark:text-amber-400/60 dark:hover:text-amber-200"
+                              title="Dismiss"
+                            >
+                              <X className="size-3.5" />
+                            </button>
+                          </div>
+                          <p className="text-[11px] text-amber-800 dark:text-amber-300 mt-1 leading-relaxed">
+                            {botChallengeInfo.message}
+                          </p>
+                          <p className="text-[11px] text-amber-900/80 dark:text-amber-200/80 font-medium mt-1.5">
+                            Please upload packaging photos manually or take a photo with your device camera:
+                          </p>
+                          <div className="flex flex-wrap items-center gap-2 mt-2 pt-2 border-t border-amber-200 dark:border-amber-800/60">
+                            <button
+                              type="button"
+                              onClick={triggerUpload}
+                              className="h-7 px-2.5 rounded bg-amber-600 hover:bg-amber-700 text-white text-[11px] font-medium flex items-center gap-1.5 shadow-xs transition-colors cursor-pointer"
+                            >
+                              <Upload className="size-3" /> Upload Packaging Photos
+                            </button>
+                            <button
+                              type="button"
+                              onClick={openCamera}
+                              className="h-7 px-2.5 rounded border border-amber-300 dark:border-amber-700 bg-white/90 dark:bg-amber-900/30 hover:bg-amber-100 text-amber-900 dark:text-amber-200 text-[11px] font-medium flex items-center gap-1.5 transition-colors cursor-pointer"
+                            >
+                              <Camera className="size-3" /> Use Camera
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
                   )}
                 </label>
               </div>
